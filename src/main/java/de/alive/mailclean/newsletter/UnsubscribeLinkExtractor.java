@@ -2,7 +2,9 @@ package de.alive.mailclean.newsletter;
 
 import lombok.extern.slf4j.Slf4j;
 
+import java.net.URL;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -10,20 +12,13 @@ import java.util.regex.Pattern;
 @Slf4j
 public class UnsubscribeLinkExtractor {
 
-    private static final Pattern[] UNSUBSCRIBE_PATTERNS = {
-            Pattern.compile("https?://[^\\s<>\"']+unsubscribe[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']+opt[_-]?out[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']+remove[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']+abmeld[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']+abbestel[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']+cancel[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']+stop[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("<?https?://[^\\s<>\"']+(?:unsubscribe|opt[_-]?out|remove|abmeld|abbestel)[^\\s<>\"']*>?", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']*mailchimp[^\\s<>\"']*unsubscribe[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']*constantcontact[^\\s<>\"']*unsubscribe[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']*sendgrid[^\\s<>\"']*unsubscribe[^\\s<>\"']*", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("https?://[^\\s<>\"']*\\.(?:us\\d+\\.list-manage\\.com|constantcontact\\.com|sendgrid\\.net|mailgun\\.org)[^\\s<>\"']*unsubscribe[^\\s<>\"']*", Pattern.CASE_INSENSITIVE)
-    };
+    private static final List<Pattern> UNSUBSCRIBE_PATTERNS = List.of(
+            Pattern.compile("https?://[^\\s\"'<>]+unsubscribe[^\\s\"'<>]*", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("https?://[^\\s\"'<>]+opt.?out[^\\s\"'<>]*", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("https?://[^\\s\"'<>]+abmelden[^\\s\"'<>]*", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("<a[^>]+href=[\"']([^\"']*unsubscribe[^\"']*)[\"'][^>]*>", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("<a[^>]+href=[\"']([^\"']*opt.?out[^\"']*)[\"'][^>]*>", Pattern.CASE_INSENSITIVE)
+    );
 
     public Set<String> extractUnsubscribeLinks(String content) {
         Set<String> links = new HashSet<>();
@@ -35,8 +30,7 @@ public class UnsubscribeLinkExtractor {
         for (Pattern pattern : UNSUBSCRIBE_PATTERNS) {
             Matcher matcher = pattern.matcher(content);
             while (matcher.find()) {
-                String link = matcher.group().trim();
-
+                String link = matcher.groupCount() > 0 ? matcher.group(1) : matcher.group();
                 link = cleanLink(link);
 
                 if (isValidLink(link)) {
@@ -49,18 +43,25 @@ public class UnsubscribeLinkExtractor {
     }
 
     private String cleanLink(String link) {
-        if (link.startsWith("<") && link.endsWith(">")) {
-            link = link.substring(1, link.length() - 1);
-        }
+        if (link == null) return "";
 
-        link = link.replaceAll("[.,;!?]+$", "");
-
-        return link.trim();
+        return link.trim()
+                .replaceAll("&amp;", "&")
+                .replaceAll("&lt;", "<")
+                .replaceAll("&gt;", ">")
+                .replaceAll("&quot;", "\"");
     }
 
     private boolean isValidLink(String link) {
-        return link.length() > 10 &&
-                (link.startsWith("http://") || link.startsWith("https://")) &&
-                link.contains(".");
+        if (link == null || link.length() < 10) {
+            return false;
+        }
+
+        try {
+            new URL(link);
+            return link.startsWith("http://") || link.startsWith("https://");
+        } catch (Exception e) {
+            return false;
+        }
     }
 }
