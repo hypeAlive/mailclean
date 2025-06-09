@@ -1,174 +1,173 @@
 package de.alive.mailclean.infrastructure;
 
 import de.alive.mailclean.Configuration;
+import de.alive.mailclean.util.LogUtils;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import reactor.util.retry.Retry;
 
 import javax.mail.*;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Properties;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
-public class ImapConnectionManager {
+public class ImapConnectionManager implements ConnectionManager {
 
     private final Configuration configuration;
     private final Properties imapProperties;
     private final List<Store> activeStores = new ArrayList<>();
+    private final Map<Store, Connection> activeConnections = new HashMap<>();
     private final Object storesLock = new Object();
-    private ScheduledExecutorService keepAliveExecutor;
+    private final AtomicInteger connectionIdGenerator = new AtomicInteger(0);
 
     public ImapConnectionManager(Configuration configuration) {
         this.configuration = configuration;
         this.imapProperties = createImapProperties();
     }
 
-    public void startKeepAlive() {
-        keepAliveExecutor = Executors.newScheduledThreadPool(1);
-        keepAliveExecutor.scheduleAtFixedRate(this::keepConnectionsAlive, 30, 30, TimeUnit.SECONDS);
-    }
-
-    public ImapConnection createConnection(int threadId, int connectionId) {
-        try {
-            long staggerDelay = (threadId * 500L) + (connectionId * 200L);
-            if (staggerDelay > 0) {
-                Thread.sleep(staggerDelay);
-            }
-
-            Store store = connectWithRetry();
-            if (store != null) {
-                synchronized (storesLock) {
-                    activeStores.add(store);
-                }
-                return new ImapConnection(store, connectionId);
-            }
-
-        } catch (Exception e) {
-            log.warn("Failed to create connection for thread {} conn {}: {}", threadId, connectionId, e.getMessage());
-        }
-
-        return null;
-    }
-
-    public boolean reconnectConnection(ImapConnection connection, int threadId) {
-        try {
-            Store oldStore = connection.getStore();
-
-            try {
-                if (oldStore.isConnected()) {
-                    oldStore.close();
-                }
-            } catch (Exception e) {
-                log.debug("Error closing old store: {}", e.getMessage());
-            }
-
-            synchronized (storesLock) {
-                activeStores.remove(oldStore);
-            }
-
-            Store newStore = connectWithRetry();
-            if (newStore != null) {
-                connection.replaceStore(newStore);
-
-                synchronized (storesLock) {
-                    activeStores.add(newStore);
-                }
-
-                log.info("✅ Thread {} Conn {}: Successfully reconnected", threadId, connection.getId());
-                return true;
-            }
-
-        } catch (Exception e) {
-            log.warn("❌ Thread {} Conn {}: Reconnection failed: {}", threadId, connection.getId(), e.getMessage());
-        }
-
-        return false;
-    }
-
-    public void shutdown() {
-        log.info("🛑 Shutting down connection manager...");
-
-        if (keepAliveExecutor != null) {
-            keepAliveExecutor.shutdown();
-        }
-
-        synchronized (storesLock) {
-            log.info("🔌 Closing {} active IMAP connections...", activeStores.size());
-            for (Store store : activeStores) {
-                try {
-                    if (store.isConnected()) {
-                        store.close();
+    @NotNull
+    @Override
+    public Mono<IConnection> createConnection() {
+        return connectWithRetry()
+                .map(store -> {
+                    int connectionId = connectionIdGenerator.incrementAndGet();
+                    Connection connection = new Connection(store, connectionId);
+                    synchronized (storesLock) {
+                        activeStores.add(store);
+                        activeConnections.put(store, connection);
                     }
-                } catch (Exception e) {
-                    log.debug("Error closing connection: {}", e.getMessage());
-                }
-            }
-            activeStores.clear();
-        }
-
-        log.info("✅ Connection manager shutdown completed");
+                    return (IConnection) connection;
+                })
+                .doOnSuccess(connection -> {
+                    Connection conn = (Connection) connection;
+                    log.info("{} IMAP connection {} created successfully",
+                            LogUtils.SUCCESS_EMOJI, conn.getId());
+                })
+                .doOnError(error ->
+                        log.error("{} Failed to create IMAP connection: {}",
+                                LogUtils.ERROR_EMOJI, error.getMessage())
+                );
     }
 
-    private void keepConnectionsAlive() {
-        synchronized (storesLock) {
-            int alive = 0;
-            List<Store> deadStores = new ArrayList<>();
+    @NotNull
+    public Mono<Boolean> closeConnection(@NotNull IConnection connection) {
+        Connection imapConnection = (Connection) connection;
+        Store store = imapConnection.getStore();
 
-            for (Store store : activeStores) {
-                try {
-                    if (store.isConnected()) {
-                        Folder inbox = store.getFolder("INBOX");
-                        if (!inbox.isOpen()) {
-                            inbox.open(Folder.READ_ONLY);
+        return Mono.fromCallable(() -> {
+                    synchronized (storesLock) {
+                        return activeConnections.get(store);
+                    }
+                })
+                .flatMap(foundConnection -> {
+                    if (foundConnection == null) {
+                        log.warn("{} Connection {} not found or already closed",
+                                LogUtils.WARNING_EMOJI, imapConnection.getId());
+                        return Mono.just(false);
+                    }
+
+                    return closeStore(foundConnection.getStore())
+                            .doOnSuccess(v -> {
+                                synchronized (storesLock) {
+                                    activeConnections.remove(store);
+                                    activeStores.remove(foundConnection.getStore());
+                                }
+                                log.info("{} Connection {} closed successfully",
+                                        LogUtils.SUCCESS_EMOJI, imapConnection.getId());
+                            })
+                            .thenReturn(true);
+                })
+                .onErrorResume(error -> {
+                    log.error("{} Failed to close connection {}: {}",
+                            LogUtils.ERROR_EMOJI, imapConnection.getId(), error.getMessage());
+                    return Mono.just(false);
+                });
+    }
+
+    @NotNull
+    @Override
+    public Mono<Boolean> reconnectConnection(@NotNull IConnection connection) {
+        ImapConnectionManager.Connection imapConnection = (ImapConnectionManager.Connection) connection;
+        return Mono.fromCallable(imapConnection::getStore)
+                .flatMap(oldStore -> closeStore(oldStore)
+                        .then(Mono.delay(Duration.ofSeconds(3))) // ✅ Longer delay for Gmail cleanup
+                        .then(connectWithRetry())
+                        .doOnSuccess(newStore -> {
+                            imapConnection.setStore(newStore);
+                            updateActiveStores(oldStore, newStore);
+                            log.info("{} Connection {} reconnected successfully",
+                                    LogUtils.SUCCESS_EMOJI, imapConnection.getId());
+                        })
+                        .thenReturn(true)
+                )
+                .onErrorResume(error -> {
+                    log.error("{} Reconnection failed for connection {}: {}",
+                            LogUtils.ERROR_EMOJI, imapConnection.getId(), error.getMessage());
+                    return Mono.just(false);
+                });
+    }
+
+    private Mono<Void> closeStore(Store oldStore) {
+        return Mono.fromRunnable(() -> {
+                    if (oldStore != null && oldStore.isConnected()) {
+                        try {
+                            // ✅ Close all open folders first
+                            if (oldStore instanceof com.sun.mail.imap.IMAPStore) {
+                                // Force close all folders
+                                oldStore.close();
+                            } else {
+                                oldStore.close();
+                            }
+                            log.debug("{} Old store closed successfully", LogUtils.SUCCESS_EMOJI);
+                        } catch (MessagingException e) {
+                            log.debug("{} Error closing old store: {}", LogUtils.WARNING_EMOJI, e.getMessage());
                         }
-                        inbox.getMessageCount(); // Keep-Alive ping
-                        inbox.close();
-                        alive++;
-                    } else {
-                        deadStores.add(store);
                     }
-                } catch (Exception e) {
-                    log.debug("Keep-Alive error for store: {}", e.getMessage());
-                    deadStores.add(store);
-                }
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .then();
+    }
+
+    private void updateActiveStores(Store oldStore, Store newStore) {
+        synchronized (storesLock) {
+            Connection connection = activeConnections.remove(oldStore);
+            if (connection != null) {
+                activeConnections.put(newStore, connection);
             }
 
-            if (!deadStores.isEmpty()) {
-                activeStores.removeAll(deadStores);
-                log.debug("🗑️ Removed {} dead connections from active list", deadStores.size());
-            }
-
-            log.debug("🔄 Keep-Alive: {}/{} connections active", alive, activeStores.size());
+            activeStores.remove(oldStore);
+            activeStores.add(newStore);
         }
     }
 
-    private Store connectWithRetry() throws MessagingException {
-        Session session = Session.getInstance(imapProperties);
-        Store store = session.getStore("imaps");
-
-        for (int attempt = 1; attempt <= 3; attempt++) {
-            try {
-                store.connect(configuration.username(), configuration.password());
-                log.debug("✅ IMAP connection established (attempt {})", attempt);
-                return store;
-            } catch (MessagingException e) {
-                log.warn("⚠️ IMAP connection attempt {} failed: {}", attempt, e.getMessage());
-                if (attempt == 3) throw e;
-
-                try {
-                    Thread.sleep(1000 * attempt);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new MessagingException("Connection interrupted", ie);
-                }
-            }
-        }
-
-        throw new MessagingException("Failed to connect after 3 attempts");
+    private Mono<Store> connectWithRetry() {
+        return Mono.fromCallable(() -> {
+                    Session session = Session.getInstance(imapProperties);
+                    Store store = session.getStore("imaps");
+                    store.connect(configuration.username(), configuration.password());
+                    log.debug("✅ IMAP connection established");
+                    return store;
+                })
+                .retryWhen(Retry.backoff(3, Duration.ofSeconds(2)) // ✅ Longer initial delay
+                        .maxBackoff(Duration.ofSeconds(15))
+                        .jitter(0.2)
+                        .filter(throwable -> throwable instanceof MessagingException)
+                        .doBeforeRetry(retrySignal ->
+                                log.warn("⚠️ IMAP connection attempt {} failed: {}",
+                                        retrySignal.totalRetries() + 1,
+                                        retrySignal.failure().getMessage()))
+                )
+                .doOnSuccess(store -> log.debug("🎯 IMAP connection successful"))
+                .doOnError(error -> log.error("❌ IMAP connection failed after retries: {}", error.getMessage()));
     }
 
+    // ✅ Optimierte IMAP Properties für Gmail Stabilität
     private Properties createImapProperties() {
         Properties props = new Properties();
         props.setProperty("mail.store.protocol", "imaps");
@@ -176,31 +175,49 @@ public class ImapConnectionManager {
         props.setProperty("mail.imaps.port", "993");
         props.setProperty("mail.imaps.ssl.enable", "true");
         props.setProperty("mail.imaps.ssl.trust", "*");
-        props.setProperty("mail.imaps.connectionpoolsize", "20");
-        props.setProperty("mail.imaps.connectionpooltimeout", "300000");
-        props.setProperty("mail.imaps.connectiontimeout", "10000");
-        props.setProperty("mail.imaps.timeout", "10000");
+
+        // ✅ DISABLE Connection Pooling - verursacht Probleme mit Gmail
+        props.setProperty("mail.imaps.connectionpoolsize", "1");
+        props.setProperty("mail.imaps.connectionpooltimeout", "5000");
+
+        // ✅ LONGER Timeouts für Gmail Stabilität
+        props.setProperty("mail.imaps.connectiontimeout", "60000");  // 60s statt 30s
+        props.setProperty("mail.imaps.timeout", "60000");           // 60s statt 30s
+        props.setProperty("mail.imaps.writetimeout", "60000");      // Write timeout
+
+        // ✅ Keep-Alive & Performance Settings
+        props.setProperty("mail.imaps.usesocketchannels", "false");
+        props.setProperty("mail.imaps.enablestarttls", "true");
+        props.setProperty("mail.imaps.socketFactory.fallback", "false");
+
+        // ✅ Gmail spezifische Optimierungen
+        props.setProperty("mail.imaps.peek", "true");              // Weniger Server Load
+        props.setProperty("mail.imaps.fetchsize", "8192");         // Kleinere Fetch Size
+        props.setProperty("mail.imaps.partialfetch", "false");     // Komplette Messages
+
+        // ✅ Additional stability settings
+        props.setProperty("mail.imaps.finalizecleanclose", "false");
+        props.setProperty("mail.imaps.closefoldersonidle", "false");
+
         return props;
     }
 
-    public static class ImapConnection {
+    @Getter
+    @AllArgsConstructor
+    public static class Connection implements IConnection {
+
+        @Setter
+        @NotNull
         private Store store;
         private final int id;
 
-        public ImapConnection(Store store, int id) {
-            this.store = store;
-            this.id = id;
-        }
-
-        public Store getStore() { return store; }
-        public int getId() { return id; }
-
-        void replaceStore(Store newStore) {
-            this.store = newStore;
-        }
-
         public boolean isConnected() {
-            return store != null && store.isConnected();
+            try {
+                return store != null && store.isConnected();
+            } catch (Exception e) {
+                log.debug("Connection check failed for {}: {}", id, e.getMessage());
+                return false;
+            }
         }
     }
 }

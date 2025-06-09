@@ -24,7 +24,7 @@ public final class LogUtils {
         if (total == 0) return "[████████████████████] 0/0 (0.0%)";
 
         double percentage = ((double) current / total) * 100;
-        int bars = (int) (percentage / 5); // 20 bars total
+        int bars = (int) (percentage / 5);
         return String.format("[%s%s] %d/%d (%.1f%%)",
                 "█".repeat(Math.max(0, bars)),
                 "░".repeat(Math.max(0, 20 - bars)),
