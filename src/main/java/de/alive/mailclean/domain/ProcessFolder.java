@@ -13,10 +13,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import javax.mail.Folder;
-import javax.mail.Message;
-import javax.mail.MessagingException;
-import javax.mail.Store;
+import javax.mail.*;
 
 @Slf4j
 @Getter
@@ -95,11 +92,19 @@ public class ProcessFolder {
                                     end, messageCount, adjustedEnd);
                         }
 
-                        return workingFolder.getMessages(start, adjustedEnd);
+                        Message[] messages = workingFolder.getMessages(start, adjustedEnd);
+
+                        FetchProfile fetchProfile = new FetchProfile();
+                        fetchProfile.add(FetchProfile.Item.ENVELOPE);
+                        fetchProfile.add(UIDFolder.FetchProfileItem.UID);
+                        workingFolder.fetch(messages, fetchProfile);
+
+                        return messages;
                     })
                     .doFinally(signalType -> closeFolder(workingFolder))
                     .subscribeOn(Schedulers.boundedElastic());
         }
+
 
         @NotNull
         private Mono<BatchEntity> createEmailFromMessage(@NotNull Message message) {

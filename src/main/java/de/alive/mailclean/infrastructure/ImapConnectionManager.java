@@ -172,16 +172,17 @@ public class ImapConnectionManager implements ConnectionManager {
 
         props.setProperty("mail.imaps.connectionpoolsize", "2");
         props.setProperty("mail.imaps.connectionpooltimeout", "5000");
-        props.setProperty("mail.imaps.connectiontimeout", "60000");
-        props.setProperty("mail.imaps.timeout", "60000");
+        props.setProperty("mail.imaps.connectiontimeout", "30000");
+        props.setProperty("mail.imaps.timeout", "30000");
         props.setProperty("mail.imaps.writetimeout", "60000");
 
-        props.setProperty("mail.imaps.usesocketchannels", "false");
+        props.setProperty("mail.imaps.usesocketchannels", "true");
         props.setProperty("mail.imaps.enablestarttls", "true");
         props.setProperty("mail.imaps.socketFactory.fallback", "false");
         props.setProperty("mail.imaps.peek", "true");
-        props.setProperty("mail.imaps.fetchsize", "8192");
-        props.setProperty("mail.imaps.partialfetch", "false");
+        props.setProperty("mail.imaps.fetchsize", "16384");
+        props.setProperty("mail.imaps.partialfetch", "true");
+        props.setProperty("mail.imaps.peek", "true");
         props.setProperty("mail.imaps.finalizecleanclose", "false");
         props.setProperty("mail.imaps.closefoldersonidle", "false");
 

@@ -20,7 +20,7 @@ import java.util.List;
 @Slf4j
 public class EmailCollector {
 
-    private static final int BATCH_SIZE = 50;
+    private static final int BATCH_SIZE = 250;
 
     @NotNull
     private final List<ProcessFolder> mailFolders;
