@@ -8,4 +8,5 @@ public interface ConnectionManager {
     @NotNull Mono<IConnection> createConnection();
     @NotNull Mono<Boolean> reconnectConnection(@NotNull IConnection connection);
     @NotNull Mono<Boolean> closeConnection(@NotNull IConnection connection);
+
 }
