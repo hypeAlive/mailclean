@@ -1,12 +1,10 @@
 package de.alive.mailclean.service;
 
 import de.alive.mailclean.infrastructure.IConnection;
-
-import javax.mail.MessagingException;
-import java.util.List;
+import reactor.core.publisher.Flux;
 
 public interface Batch {
 
-    List<BatchEntity> entities(IConnection connection);
+    Flux<BatchEntity> entities(IConnection connection);
 
 }

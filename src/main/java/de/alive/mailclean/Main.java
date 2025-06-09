@@ -21,8 +21,8 @@ public class Main {
         BatchProcessor processor = new BatchProcessor(manager, 7);
         folderDiscovery.discoverAllFolders()
                 .flatMapMany(folders -> new EmailCollector(analyser, processor, folders).getMailStream())
-                .doOnNext(entity -> {
-                    log.info("Processed Mail");
+                .doOnNext(email -> {
+                    log.info("Processing email: {}", email.getSubject());
                 })
                 .doOnComplete(() -> log.info("All emails processed"))
                 .doOnError(error -> log.error("Error in email stream: {}", error.getMessage()))

@@ -40,7 +40,7 @@ public class EmailCollector {
                 .flatMapMany(batches -> processor.processAllBatches(batches, (batch, con) -> {
                     return batch;
                 }))
-                .map(batch -> (Email) batch)
+                .cast(Email.class)
                 .onErrorMap(MessagingException.class, ex -> {
                     log.error("Error processing mail stream", ex);
                     return new RuntimeException("Failed to process mail stream", ex);

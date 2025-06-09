@@ -9,12 +9,14 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import javax.mail.Folder;
+import javax.mail.Message;
 import javax.mail.MessagingException;
 import javax.mail.Store;
-import java.util.Arrays;
-import java.util.List;
 
 @Slf4j
 @Getter
@@ -40,6 +42,7 @@ public class ProcessFolder {
     }
 
     public record MailBatch(@NotNull ProcessFolder folder, int start, int end) implements Batch {
+
         public MailBatch {
             if (start <= 0 || end <= 0 || start > end)
                 throw InvalidFolderException.invalidBatchRange(this);
@@ -50,77 +53,83 @@ public class ProcessFolder {
         }
 
         @Override
-        public List<BatchEntity> entities(IConnection connection) {
-            log.info("Get Entities with connection {}",
-                    connection instanceof ImapConnectionManager.Connection ?
-                            ((ImapConnectionManager.Connection) connection).getId() : "unknown");
+        @NotNull
+        public Flux<BatchEntity> entities(@NotNull IConnection connection) {
+            return openFolder(connection)
+                    .flatMap(this::getMessagesFromFolder)
+                    .flatMapMany(messages -> Flux.fromArray(messages)
+                            .flatMap(this::createEmailFromMessage)
+                            .onErrorResume(error -> {
+                                log.warn("Skipping message due to error: {}", error.getMessage());
+                                return Mono.empty();
+                            }));
+        }
 
-            Folder workingFolder = null;
-            try {
-                // ✅ Verwende die Connection um den Folder zu öffnen
-                assert connection instanceof ImapConnectionManager.Connection;
-                Store store = ((ImapConnectionManager.Connection) connection).getStore();
+        @NotNull
+        private Mono<Folder> openFolder(@NotNull IConnection connection) {
+            return Mono.fromCallable(() -> {
+                        ImapConnectionManager.Connection imapConn = (ImapConnectionManager.Connection) connection;
+                        Store store = imapConn.getStore();
 
-                // ✅ Check store connection before use
-                if (!store.isConnected()) {
-                    throw new MessagingException("Store is not connected");
-                }
+                        Folder workingFolder = store.getFolder(folder().getFolder().getFullName());
 
-                workingFolder = store.getFolder(folder().getFolder().getFullName());
+                        workingFolder.open(Folder.READ_ONLY);
+                        return workingFolder;
+                    })
+                    .subscribeOn(Schedulers.boundedElastic());
+        }
 
-                // ✅ Check if folder exists before opening
-                if (!workingFolder.exists()) {
-                    throw new MessagingException("Folder does not exist: " + workingFolder.getFullName());
-                }
+        @NotNull
+        private Mono<Message[]> getMessagesFromFolder(@NotNull Folder workingFolder) {
+            return Mono.fromCallable(() -> {
+                        int messageCount = workingFolder.getMessageCount();
 
-                workingFolder.open(Folder.READ_ONLY);
+                        if (start > messageCount) {
+                            log.warn("Batch start {} exceeds message count {}", start, messageCount);
+                            return new Message[0];
+                        }
 
-                // ✅ Validate message range
-                int messageCount = workingFolder.getMessageCount();
-                if (end > messageCount) {
-                    log.warn("Batch end {} exceeds message count {}, adjusting", end, messageCount);
-                }
+                        int adjustedEnd = Math.min(end, messageCount);
+                        if (end > messageCount) {
+                            log.warn("Batch end {} exceeds message count {}, adjusting to {}",
+                                    end, messageCount, adjustedEnd);
+                        }
 
-                if (start > messageCount) {
-                    log.warn("Batch start {} exceeds message count {}, returning empty", start, messageCount);
-                    return List.of();
-                }
+                        return workingFolder.getMessages(start, adjustedEnd);
+                    })
+                    .doFinally(signalType -> closeFolder(workingFolder))
+                    .subscribeOn(Schedulers.boundedElastic());
+        }
 
-                Folder finalWorkingFolder = workingFolder;
-                return Arrays.stream(workingFolder.getMessages(start, Math.min(end, messageCount)))
-                        .map(message -> {
-                            try {
-                                return (BatchEntity) new Email(
-                                        message.getMessageNumber(),
-                                        message.getSubject() != null ? message.getSubject() : "No Subject",
-                                        folder()
-                                );
-                            } catch (MessagingException e) {
-                                log.error("Failed to get message {} from folder: {}",
-                                        message.getMessageNumber(), finalWorkingFolder.getFullName(), e);
-                                // ✅ Return placeholder instead of throwing
-                                return (BatchEntity) new Email(
-                                        message.getMessageNumber(),
-                                        "Error reading message",
-                                        folder()
-                                );
-                            }
-                        }).toList();
+        @NotNull
+        private Mono<BatchEntity> createEmailFromMessage(@NotNull Message message) {
+            return Mono.fromCallable(() -> {
+                        String subject = message.getSubject();
+                        return (BatchEntity) new Email(
+                                message.getMessageNumber(),
+                                subject,
+                                folder()
+                        );
+                    })
+                    .onErrorResume(error -> Mono.empty())
+                    .subscribeOn(Schedulers.boundedElastic());
+        }
 
-            } catch (MessagingException e) {
-                log.error("Failed to get messages from folder: {}", folder().getFolder().getFullName(), e);
-                throw new RuntimeException("Failed to get messages from folder: " + e.getMessage(), e);
-            } finally {
-                // ✅ ALWAYS close folder to prevent resource leaks!
-                if (workingFolder != null && workingFolder.isOpen()) {
-                    try {
-                        workingFolder.close(false); // false = don't expunge
-                        log.debug("Folder {} closed successfully", workingFolder.getFullName());
-                    } catch (MessagingException e) {
-                        log.warn("Failed to close folder {}: {}", workingFolder.getFullName(), e.getMessage());
-                    }
-                }
+        private void closeFolder(@Nullable Folder workingFolder) {
+            if (workingFolder != null && workingFolder.isOpen()) {
+                Mono.fromCallable(() -> {
+                            workingFolder.close(false);
+                            return null;
+                        })
+                        .onErrorResume(MessagingException.class, e -> {
+                            log.warn("Failed to close folder {}: {}",
+                                    workingFolder.getFullName(), e.getMessage());
+                            return Mono.empty();
+                        })
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribe();
             }
         }
+
     }
 }

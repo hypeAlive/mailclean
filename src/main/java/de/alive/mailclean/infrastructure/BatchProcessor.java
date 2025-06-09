@@ -46,10 +46,10 @@ public class BatchProcessor {
                 .then(Mono.just(batches))
                 .flatMapMany(batchList ->
                         Flux.fromIterable(batchList)
-                                .parallel(threadCount)
-                                .runOn(workerScheduler)
-                                .flatMap(batch -> processBatch(batch, processor))
-                                .sequential()
+                                // ✅ Keine parallele Aufteilung, sondern sequenzielle Verarbeitung mit begrenzter Concurrency
+                                .flatMap(batch -> processBatch(batch, processor), threadCount)
+                                // ✅ Verwende den workerScheduler für die Ausführung
+                                .subscribeOn(workerScheduler)
                 );
     }
 
@@ -86,23 +86,28 @@ public class BatchProcessor {
 
     private Flux<BatchEntity> processBatch(Batch batch, BiFunction<BatchEntity, IConnection, BatchEntity> processor) {
         return acquireConnection()
-                .flatMapMany(connection ->
-                        Flux.fromIterable(batch.entities(connection))
-                                .map(entity -> processor.apply(entity, connection))
-                                .doFinally(signalType -> releaseConnection(connection))
-                )
+                .flatMapMany(connection -> {
+                    return batch.entities(connection)
+                            .map(entity -> processor.apply(entity, connection))
+                            .doFinally(signalType -> {
+                                // ✅ Sofortiger Release im selben Thread
+                                releaseConnection(connection);
+                                log.debug("{} Connection {} released after batch completion",
+                                        LogUtils.SUCCESS_EMOJI, connection.getId());
+                            });
+                })
                 .onErrorResume(error -> {
                     log.error("{} Batch processing failed, skipping batch: {}",
                             LogUtils.ERROR_EMOJI, error.getMessage());
-                    return Flux.empty(); // ✅ Continue with other batches
+                    return Flux.empty();
                 });
     }
 
     private Mono<IConnection> acquireConnection() {
         return Mono.fromCallable(() -> {
                     try {
-                        // ✅ Timeout statt blocking wait
-                        boolean acquired = connectionSemaphore.tryAcquire(15, TimeUnit.SECONDS);
+                        // ✅ Längerer Timeout da wir jetzt warten können
+                        boolean acquired = connectionSemaphore.tryAcquire(60, TimeUnit.SECONDS);
                         if (!acquired) {
                             throw new RuntimeException("Timeout waiting for connection semaphore");
                         }
@@ -141,7 +146,7 @@ public class BatchProcessor {
                         return Mono.error(new RuntimeException("No connection available from pool"));
                     }
                 })
-                .timeout(Duration.ofSeconds(20)); // ✅ Reduced timeout
+                .timeout(Duration.ofSeconds(70)); // ✅ Längerer Timeout passend zum Semaphore-Timeout
     }
 
     private void releaseConnection(IConnection connection) {
